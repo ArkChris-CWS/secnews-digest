@@ -1,0 +1,22 @@
+name: security-morning-digest
+
+on:
+  schedule:
+    # UTC 23:00 = 한국시간(KST) 다음 날 08:00. cron은 항상 UTC 기준이다.
+    - cron: "0 23 * * *"
+  workflow_dispatch: {}   # 수동 실행(테스트)용 버튼
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python main.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
