@@ -2,8 +2,9 @@ name: security-morning-digest
 
 on:
   schedule:
-    # UTC 23:00 = 한국시간(KST) 다음 날 08:00. cron은 항상 UTC 기준이다.
-    - cron: "0 23 * * *"
+    # UTC 21:40 = 한국시간(KST) 06:40 목표. cron은 항상 UTC 기준이다.
+    # GitHub Actions 스케줄은 best-effort라 정각보다 비정각이 덜 밀린다.
+    - cron: "40 21 * * *"
   workflow_dispatch: {}   # 수동 실행(테스트)용 버튼
 
 jobs:
