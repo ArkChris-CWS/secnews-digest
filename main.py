@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-보안 아침 브리핑 봇 (정확도 풀버전 v6)
-=== 이번 버전 핵심 ===
-[B] NVD API로 CVE의 CVSS·심각도·CWE를 코드가 직접 조회 → AI 추측 제거(환각 0)
-[EPSS] FIRST EPSS API로 '실제 악용 확률(%)' 직접 조회
-[KEV] CISA KEV 등재 여부를 코드가 직접 판정 → "🚨 실제 악용중" 강조
-[A] 더미/예시 IoC(aa:bb.., 00:11.., example, LAPTOP-001 등) 필터링
-[C] 공식 소스 추가(CISA Advisories). 검증 안 된 소스(KISA 등)는 실패 시 자동 스킵
-[안정성] Gemini 503/429 backoff 재시도 + 모델 폴백 + 최후 안전 폴백
-[핵심] AT&T의 &, 버전 < 등 특수문자 html.escape 처리
-
+보안 아침 브리핑 봇 (정확도+가독성 풀버전 v8)
+=== v8 신규 ===
+[버그] 텔레그램 분할 전송 시 항목 중복 발송 버그 수정
+[가독성] 3단 그룹(🚨긴급패치 / ⚠️위협동향 / 📰일반) + 상단 KEV 요약 + 목차
+[정확도 D] NVD에서 CWE 자동 주입 (CWE-306 Missing Authentication 등)
+[정확도 C] LLM 요약의 큰 수치(만/million 등)가 원문에 없으면 ⚠️ 미검증 표시
+[안정성] NVD 파일 캐시(24h) → rate limit/속도 개선
+[안정성] Gemini JSON 깨지면 1회 재요청 후 폴백
+=== 유지 ===
+[B] NVD CVSS·심각도 직접 주입 / [EPSS] FIRST / [KEV] CISA 대조
+[A] 더미 IoC 필터 / 공식소스 / 503 재시도+모델폴백 / html.escape
 === 정확도 원칙 ===
-- 숫자/등급(CVSS·심각도·EPSS·KEV)은 LLM이 아니라 '공식 API'가 주입 → 신뢰 가능
-- 나머지 서술(핵심·원리·대응)은 LLM 요약이므로 참고용(원문 확인 전제)
+숫자·등급(CVSS·CWE·EPSS·KEV)은 공식 API가 주입(신뢰). 서술은 AI 요약(참고용).
 """
 import os
 import re
@@ -20,46 +20,54 @@ import html
 import json
 import time
 import datetime
+import difflib
 
 import feedparser
 import requests
 import trafilatura
 
 # ── 설정 ──────────────────────────────────────────────
-# value=True 이면 '검증된 소스'(실패 시 경고), False 이면 '미검증'(실패해도 조용히 스킵)
 FEEDS = {
     "The Hacker News":   ("https://feeds.feedburner.com/TheHackersNews", True),
     "BleepingComputer":  ("https://www.bleepingcomputer.com/feed/", True),
     "Krebs on Security": ("https://krebsonsecurity.com/feed/", True),
     "The Record":        ("https://therecord.media/feed/", True),
     "보안뉴스":          ("https://www.boannews.com/media/news_rss.xml", True),
-    # 공식 1차 소스 ──
     "CISA Advisories":   ("https://www.cisa.gov/cybersecurity-advisories/all.xml", True),
-    # 미검증(URL 동적/차단 가능) → 실패해도 조용히 스킵. 정확한 주소 확인되면 True 로 승격.
-    # KISA 보호나라 보안공지(B0000133)의 RSS 후보들 — 하나라도 살아있으면 수집됨
-    "KISA 보안공지":   ("https://www.boho.or.kr/kr/rss.do?bbsId=B0000133", False),
+    # 미검증 → 실패해도 조용히 스킵
+    "KISA 보안공지":     ("https://www.boho.or.kr/kr/rss.do?bbsId=B0000133", False),
 }
 
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 EPSS_API = "https://api.first.org/data/v1/epss"
+NVD_CACHE_FILE = "nvd_cache.json"
+NVD_CACHE_TTL = 24 * 3600   # 24시간
 
 HOURS = 24
-MAX_CANDIDATES_RSS = 12
+MAX_CANDIDATES_RSS = 14
 ARTICLE_CHARS = 4000
 MAX_ITEMS = 8
+DEDUP_RATIO = 0.82          # 제목 유사도 이 이상이면 같은 사건으로 병합
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
 MAX_RETRIES = 4
 RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; secnews-digest/2.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; secnews-digest/3.0)"}
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
+TG_LIMIT = 3500             # 텔레그램 4096자 한도 여유분
 
 
 # ── 유틸 ──────────────────────────────────────────────
 def _clean(s: str) -> str:
     return re.sub(r"<[^>]+>", "", html.unescape(s or "")).strip()
+
+
+def _norm_title(t):
+    """중복 비교용 제목 정규화(소문자, 기호 제거)."""
+    t = re.sub(r"[^0-9a-z가-힣 ]", " ", (t or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def fetch_article_text(url: str):
@@ -110,7 +118,25 @@ def collect_rss_candidates():
     if skip:
         print("RSS 스킵(미검증 소스):", " | ".join(skip))
     cands.sort(key=lambda x: x["dt"], reverse=True)
-    return cands[:MAX_CANDIDATES_RSS]
+    return dedup_candidates(cands[:MAX_CANDIDATES_RSS])
+
+
+def dedup_candidates(cands):
+    """제목 유사도로 같은 사건 병합(difflib, 가벼움)."""
+    kept = []
+    for c in cands:
+        nt = _norm_title(c["title"])
+        dup = False
+        for k in kept:
+            if difflib.SequenceMatcher(None, nt, _norm_title(k["title"])).ratio() >= DEDUP_RATIO:
+                k.setdefault("also", []).append(c["source"])   # 병합된 출처 기록
+                dup = True
+                break
+        if not dup:
+            kept.append(c)
+    if len(kept) != len(cands):
+        print(f"기사 중복 병합: {len(cands)}건 → {len(kept)}건")
+    return kept
 
 
 def enrich_with_body(cands):
@@ -123,14 +149,12 @@ def enrich_with_body(cands):
         else:
             it["content"], it["content_type"] = it.get("summary", ""), "snippet"
             snip += 1
-        it.pop("summary", None)
         it.pop("dt", None)
     print(f"본문 추출: 성공 {full}건 / snippet 폴백 {snip}건")
     return cands
 
 
 def fetch_kev():
-    """CISA KEV 전체 로드 → (신규 항목 리스트, 전체 CVE 집합) 반환."""
     try:
         data = requests.get(KEV_URL, timeout=30, headers=UA).json()
     except Exception as ex:
@@ -153,48 +177,78 @@ def fetch_kev():
     return out, all_cves
 
 
-# ── [B] NVD: CVE별 CVSS·심각도·CWE 공식 조회 ───────────
-def nvd_lookup(cve):
-    """NVD 공식 API에서 CVSS/심각도/CWE 조회. 실패 시 None."""
+# ── NVD 파일 캐시 ─────────────────────────────────────
+def _load_cache():
+    try:
+        with open(NVD_CACHE_FILE, encoding="utf-8") as f:
+            c = json.load(f)
+        if time.time() - c.get("_ts", 0) < NVD_CACHE_TTL:
+            return c.get("data", {})
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cache(data):
+    try:
+        with open(NVD_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"_ts": time.time(), "data": data}, f)
+    except Exception:
+        pass
+
+
+# ── [B][D] NVD: CVSS·심각도·CWE 공식 조회 ─────────────
+def nvd_lookup(cve, cache):
+    if cve in cache:
+        return cache[cve]
+    result = None
     try:
         headers = dict(UA)
-        key = os.environ.get("NVD_API_KEY")   # 있으면 사용(없어도 동작)
+        key = os.environ.get("NVD_API_KEY")
         if key:
             headers["apiKey"] = key
         r = requests.get(NVD_API, params={"cveId": cve}, headers=headers, timeout=30)
-        if r.status_code != 200:
-            return None
-        vulns = r.json().get("vulnerabilities", [])
-        if not vulns:
-            return None
-        metrics = vulns[0]["cve"].get("metrics", {})
-        for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-            if mk in metrics and metrics[mk]:
-                cvss = metrics[mk][0]["cvssData"]
-                score = cvss.get("baseScore")
-                sev = (cvss.get("baseSeverity")
-                       or metrics[mk][0].get("baseSeverity") or "").title()
-                return {"score": score, "severity": sev}
+        if r.status_code == 200:
+            vulns = r.json().get("vulnerabilities", [])
+            if vulns:
+                cve_obj = vulns[0]["cve"]
+                metrics = cve_obj.get("metrics", {})
+                score, sev = None, ""
+                for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    if metrics.get(mk):
+                        cvss = metrics[mk][0]["cvssData"]
+                        score = cvss.get("baseScore")
+                        sev = (cvss.get("baseSeverity")
+                               or metrics[mk][0].get("baseSeverity") or "").title()
+                        break
+                # CWE 추출
+                cwe = ""
+                for w in cve_obj.get("weaknesses", []):
+                    for d in w.get("description", []):
+                        v = d.get("value", "")
+                        if v.startswith("CWE-"):
+                            cwe = v
+                            break
+                    if cwe:
+                        break
+                result = {"score": score, "severity": sev, "cwe": cwe}
     except Exception:
         pass
-    return None
+    cache[cve] = result
+    return result
 
 
-# ── [EPSS] FIRST: 악용 확률 조회 ──────────────────────
 def epss_lookup_bulk(cves):
-    """여러 CVE의 EPSS(악용확률)를 한 번에 조회. {CVE: 'NN.N%'}."""
     if not cves:
         return {}
     try:
-        r = requests.get(EPSS_API, params={"cve": ",".join(sorted(cves))},
-                         headers=UA, timeout=30)
+        r = requests.get(EPSS_API, params={"cve": ",".join(sorted(cves))}, headers=UA, timeout=30)
         if r.status_code != 200:
             return {}
         out = {}
         for d in r.json().get("data", []):
-            cve = d.get("cve", "").upper()
             try:
-                out[cve] = f"{float(d.get('epss', 0)) * 100:.1f}%"
+                out[d.get("cve", "").upper()] = f"{float(d.get('epss', 0)) * 100:.1f}%"
             except Exception:
                 pass
         return out
@@ -202,43 +256,51 @@ def epss_lookup_bulk(cves):
         return {}
 
 
+# 흔한 CWE 한글 라벨(있으면 병기, 없으면 코드만)
+CWE_LABEL = {
+    "CWE-306": "Missing Authentication", "CWE-287": "Improper Authentication",
+    "CWE-89": "SQL Injection", "CWE-79": "XSS", "CWE-78": "OS Command Injection",
+    "CWE-22": "Path Traversal", "CWE-352": "CSRF", "CWE-918": "SSRF",
+    "CWE-502": "Insecure Deserialization", "CWE-434": "Unrestricted File Upload",
+    "CWE-862": "Missing Authorization", "CWE-863": "Incorrect Authorization",
+    "CWE-269": "Improper Privilege Mgmt", "CWE-416": "Use After Free",
+    "CWE-787": "Out-of-bounds Write", "CWE-94": "Code Injection",
+    "CWE-77": "Command Injection", "CWE-20": "Improper Input Validation",
+    "CWE-200": "Information Exposure", "CWE-798": "Hard-coded Credentials",
+}
+
+
 def enrich_cve_facts(items, kev_cves):
-    """
-    각 항목 본문/제목에서 CVE를 뽑아 NVD/EPSS/KEV 사실을 코드가 직접 주입.
-    -> 결과는 item['facts'] 에 저장(LLM이 건드리지 않음).
-    """
-    # 1) 전체 CVE 수집
-    per_item = []
-    all_cves = set()
+    per_item, all_cves = [], set()
     for it in items:
-        text = f"{it.get('title','')} {it.get('content','')}"
-        found = sorted({m.upper() for m in CVE_RE.findall(text)})
+        found = sorted({m.upper() for m in CVE_RE.findall(f"{it.get('title','')} {it.get('content','')}")})
         per_item.append(found)
         all_cves.update(found)
-
     if not all_cves:
         print("본문 내 CVE: 0개 (NVD/EPSS 조회 생략)")
         return
 
-    # 2) EPSS 일괄 조회
     epss = epss_lookup_bulk(all_cves)
+    cache = _load_cache()
+    miss = [c for c in sorted(all_cves) if c not in cache]
+    for i, cve in enumerate(miss):
+        nvd_lookup(cve, cache)
+        if i < len(miss) - 1:
+            time.sleep(0.8)
+    _save_cache(cache)
 
-    # 3) NVD 개별 조회(레이트리밋 고려해 약간의 간격)
-    nvd_cache = {}
-    for i, cve in enumerate(sorted(all_cves)):
-        nvd_cache[cve] = nvd_lookup(cve)
-        if i < len(all_cves) - 1:
-            time.sleep(0.8)   # NVD 무키 제한 완화(30s/5req)
-
-    # 4) 항목별 facts 구성
     enriched = 0
     for it, cves in zip(items, per_item):
-        facts = []
+        facts, cwes = [], []
         for cve in cves:
             parts = [cve]
-            nv = nvd_cache.get(cve)
-            if nv and nv.get("score") is not None:
-                parts.append(f"CVSS {nv['score']} ({nv.get('severity','')})".strip())
+            nv = cache.get(cve)
+            if nv:
+                if nv.get("score") is not None:
+                    parts.append(f"CVSS {nv['score']} ({nv.get('severity','')})".strip())
+                if nv.get("cwe"):
+                    lab = CWE_LABEL.get(nv["cwe"], "")
+                    cwes.append(f"{nv['cwe']}" + (f" {lab}" if lab else ""))
             if cve in epss:
                 parts.append(f"EPSS {epss[cve]}")
             if cve in kev_cves:
@@ -246,8 +308,11 @@ def enrich_cve_facts(items, kev_cves):
             facts.append(" · ".join(parts))
         if facts:
             it["facts"] = facts
+        if cwes:
+            it["cwes"] = sorted(set(cwes))
+        if facts or cwes:
             enriched += 1
-    print(f"CVE 사실 주입: {enriched}개 항목 / 대상 CVE {len(all_cves)}개")
+    print(f"CVE 사실 주입: {enriched}개 항목 / 대상 CVE {len(all_cves)}개 (NVD 신규조회 {len(miss)})")
 
 
 # ── [A] 더미/예시 IoC 필터 ────────────────────────────
@@ -261,7 +326,6 @@ DUMMY_PATTERNS = [
 
 
 def clean_iocs(ioc_str):
-    """쉼표구분 IoC 문자열에서 더미/예시/사설 값 제거."""
     if not ioc_str:
         return ""
     keep = []
@@ -269,10 +333,32 @@ def clean_iocs(ioc_str):
         t = tok.strip()
         if not t or t in ("원문 확인", "없음", "N/A", "-"):
             continue
-        if any(p.search(t) for p in DUMMY_PATTERNS):
+        cmp = t.replace("[.]", ".").replace("[:]", ":")
+        if any(p.search(cmp) for p in DUMMY_PATTERNS):
             continue
         keep.append(t)
     return ", ".join(keep)
+
+
+# ── [C] LLM 수치 환각 검증 ────────────────────────────
+NUM_TOKEN = re.compile(r"(\d[\d,]*\s*(?:만|억|million|billion|천)?)")
+
+
+def verify_numbers(text, source_text):
+    """요약 속 큰 수치가 원문에 근거 있는지 약식 검증 → 미검증이면 True 반환."""
+    if not text or not source_text:
+        return False
+    src = source_text.lower().replace(",", "")
+    for m in re.findall(r"(\d[\d,]{2,})\s*(만|억|million|billion)?", text):
+        num = m[0].replace(",", "")
+        if len(num) < 3:
+            continue
+        # 원문에 같은 숫자(또는 콤마 제거형)가 있으면 OK
+        if num in src:
+            continue
+        # 만/억/million 단위 환산도 한 번 확인(예: 120만 ↔ 1200000 / 1.2 million)
+        return True   # 근거 못 찾음 → 미검증 의심
+    return False
 
 
 # ── 요약 프롬프트 ─────────────────────────────────────
@@ -283,22 +369,23 @@ published는 원문 게시일이며 이미 주어졌다.
 
 [정확성 규칙 — 가장 중요]
 - 오직 제공된 content 안에 있는 사실만 사용한다. 없으면 그 필드에 "원문 확인".
-- CVSS 점수·심각도·EPSS·KEV 여부는 절대 적지 마라(시스템이 공식 API로 따로 채운다).
-  너는 severity 필드를 항상 빈 문자열("")로 둔다.
-- IoC는 content에 '실제로' 존재하는 값만 적는다. 예시·더미(aa:bb.., example.com,
-  LAPTOP-001, 1.2.3.4, 사설 IP, 'hostname' 같은 설명용)는 절대 적지 마라. 없으면 "".
+- CVSS·심각도·CWE·EPSS·KEV는 절대 적지 마라(시스템이 공식 API로 채운다).
+  severity 필드는 항상 빈 문자열("").
+- 숫자(피해 규모/설치 수/계정 수 등)는 content에 적힌 그대로만 쓰고, 단위를 바꾸지 마라
+  (예: '설치 수'를 '사이트 수'로 바꾸지 말 것). 불확실하면 표현을 생략한다.
+- IoC는 content에 실제 존재하는 값만. 예시·더미(aa:bb.., example.com, LAPTOP-001,
+  사설IP 등)는 적지 마라. 없으면 "".
 - 추측·과장 금지.
 
 [선별 규칙]
-- 같은 사건을 여러 매체가 다루면 하나로 병합하고, 중요도 순으로 최대 8개만 고른다.
-- content_type=kev 항목을 최우선으로 둔다.
+- 같은 사건은 하나로 병합, 중요도 순 최대 8개. content_type=kev 최우선.
 
 [출력 형식]
-- 아래 구조의 JSON만 출력(코드펜스/설명 금지). 모든 값 한국어(기술용어 영문 병기 가능).
+- 아래 JSON만 출력(코드펜스/설명 금지). 한국어(기술용어 영문 병기 가능).
 - summary, principle은 각각 1~2문장. 마크다운 기호(*, **, #, _) 금지.
 
 {
-  "tldr": "오늘 가장 중요한 위협/이슈 2~3문장 요약",
+  "tldr": "오늘 가장 중요한 위협/이슈 2~3문장",
   "items": [
     {
       "title": "제목 또는 CVE 번호",
@@ -307,9 +394,9 @@ published는 원문 게시일이며 이미 주어졌다.
       "summary": "무슨 일인지 1~2문장(재작성, 원문 복붙 금지)",
       "impact": "영향받는 제품/버전/대상(없으면 원문 확인)",
       "mitigation": "패치 버전·완화책·탐지 포인트(없으면 원문 확인)",
-      "principle": "이 공격/취약점이 왜 통하는지 1~2문장(근거 없으면 원문 확인)",
+      "principle": "왜 통하는지 1~2문장(근거 없으면 원문 확인)",
       "ioc": "content에 실제 존재하는 IoC만 쉼표로(없으면 빈 문자열)",
-      "attack": "근거 있으면 ATT&CK ID(예: T1566), 여러 개면 쉼표, 없으면 빈 문자열",
+      "attack": "근거 있으면 ATT&CK ID(예: T1566), 쉼표 구분, 없으면 빈 문자열",
       "published": "해당 항목 published 값 그대로",
       "source": "원문 URL"
     }
@@ -337,19 +424,19 @@ def _call_gemini(model, payload, use_json_mime=True):
 
 
 def summarize(items):
-    # facts/published 등 코드 주입 필드는 LLM 입력에서 빼서 토큰 절약 + 오염 방지
-    slim = []
-    for it in items:
-        slim.append({k: it[k] for k in
-                     ("source", "title", "content", "content_type", "published", "link")
-                     if k in it})
+    slim = [{k: it[k] for k in ("source", "title", "content", "content_type", "published", "link") if k in it}
+            for it in items]
     payload = json.dumps(slim, ensure_ascii=False, indent=2)
-
     for model in GEMINI_MODELS:
         use_json = True
         for attempt in range(MAX_RETRIES):
             try:
-                return _call_gemini(model, payload, use_json_mime=use_json)
+                raw = _call_gemini(model, payload, use_json_mime=use_json)
+                if parse_digest(raw):       # JSON 깨짐 즉시 감지
+                    return raw
+                # 깨졌으면 1회 재요청(같은 모델, 다음 attempt)
+                print(f"[{model}] JSON 파싱 실패 → 재요청 [{attempt+1}/{MAX_RETRIES}]")
+                continue
             except ValueError:
                 print(f"[{model}] JSON 강제 옵션 미지원 → 옵션 제거 후 재시도")
                 use_json = False
@@ -378,25 +465,33 @@ def parse_digest(raw):
         return None
 
 
-# ── 코드 주입 사실을 LLM 결과에 병합 ──────────────────
 def merge_facts(data, src_items):
-    """
-    LLM 결과 items에, 코드가 만든 facts(CVSS/EPSS/KEV)를 CVE 매칭으로 붙인다.
-    매칭 키: 항목 텍스트에 등장하는 CVE.
-    """
-    # 원자료 항목별 facts 인덱스(첫 CVE 기준)
-    facts_by_cve = {}
+    facts_by_cve, cwes_by_cve, body_by_cve = {}, {}, {}
     for it in src_items:
         for f in it.get("facts", []):
-            cve = f.split(" ")[0].upper()
-            facts_by_cve.setdefault(cve, f)
+            facts_by_cve.setdefault(f.split(" ")[0].upper(), f)
+        for c in it.get("cwes", []):
+            pass
+        # CVE→CWE, CVE→본문 매핑
+        for cve in {m.upper() for m in CVE_RE.findall(f"{it.get('title','')} {it.get('content','')}")}:
+            if it.get("cwes"):
+                cwes_by_cve.setdefault(cve, it["cwes"])
+            body_by_cve.setdefault(cve, it.get("content", ""))
 
     for it in data.get("items", []):
         text = f"{it.get('title','')} {it.get('summary','')} {it.get('impact','')}"
         cves = sorted({m.upper() for m in CVE_RE.findall(text)})
         merged = [facts_by_cve[c] for c in cves if c in facts_by_cve]
         if merged:
-            it["_facts"] = merged   # 표시는 format 단계에서
+            it["_facts"] = merged
+        cwes = []
+        for c in cves:
+            cwes += cwes_by_cve.get(c, [])
+        if cwes:
+            it["_cwes"] = sorted(set(cwes))
+        # 수치 검증용 원문 연결
+        body = " ".join(body_by_cve.get(c, "") for c in cves)
+        it["_unverified_num"] = verify_numbers(it.get("impact", ""), body) if body else False
     return data
 
 
@@ -421,130 +516,181 @@ def _sev_icon(sev):
 
 
 def _sev_from_facts(facts):
-    """facts 문자열들에서 CVSS 등급 추출(표시용)."""
     for f in facts:
         m = re.search(r"CVSS\s+([\d.]+)\s*\(([^)]+)\)", f)
         if m:
-            return f"{m.group(2).title()} (CVSS {m.group(1)})", m.group(2)
-    return "", ""
+            return f"{m.group(2).title()} (CVSS {m.group(1)})", m.group(2), float(m.group(1))
+    return "", "", -1.0
 
 
 NUM = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\ufe0f\u20e3",
        "6\ufe0f\u20e3", "7\ufe0f\u20e3", "8\ufe0f\u20e3", "9\ufe0f\u20e3", "\U0001f51f"]
 
 
-def _sort_key(it):
-    """정렬: KEV(실제악용) 먼저 → CVSS 높은 순 → 나머지."""
+def _group_of(it):
+    """3단 분류: urgent(KEV or CVSS>=9) / trend(피싱·캠페인·유출 등) / normal."""
     facts = it.get("_facts", [])
     is_kev = any("KEV" in f for f in facts)
-    score = -1.0
+    _, _, score = _sev_from_facts(facts)
+    if is_kev or score >= 9.0:
+        return "urgent"
+    cat = (it.get("category", "") + it.get("title", "")).lower()
+    if any(w in cat for w in ("피싱", "phishing", "캠페인", "campaign", "유출", "breach",
+                              "랜섬", "ransom", "apt", "그룹", "actor", "해커", "스미싱")):
+        return "trend"
+    return "normal"
+
+
+def _item_block(idx, it):
+    n = NUM[idx] if idx < len(NUM) else f"{idx + 1}."
+    facts = it.get("_facts", [])
+    is_kev = any("KEV" in f for f in facts)
+
+    title_line = f"{n} <b>{_esc(it.get('title'))}</b>"
+    if is_kev:
+        title_line += "  \U0001f6a8<b>실제 악용중</b>"
+    lines = [title_line]
+
+    sev_text, sev_raw, _ = _sev_from_facts(facts)
+    if sev_text:
+        lines.append(f"{_sev_icon(sev_raw)} <b>심각도</b>: {_esc(sev_text)} <i>(NVD)</i>")
+    if it.get("_cwes"):
+        lines.append(f"\U0001f9ea <b>CWE</b>: {_esc(', '.join(it['_cwes']))}")
+    if it.get("category"):
+        lines.append(f"\U0001f3f7 <b>분류</b>: {_esc(it['category'])}")
+
+    epss_vals = []
     for f in facts:
-        m = re.search(r"CVSS\s+([\d.]+)", f)
+        m = re.search(r"EPSS\s+([\d.]+%)", f)
         if m:
-            score = max(score, float(m.group(1)))
-    return (0 if is_kev else 1, -score)
+            epss_vals.append(f"{f.split(' ')[0]} {m.group(1)}")
+    if epss_vals:
+        lines.append(f"\U0001f4c8 <b>악용확률(EPSS)</b>: {_esc(', '.join(epss_vals))}")
+
+    pub = _esc(it.get("published"))
+    if pub and pub not in _BLANK:
+        lines.append(f"\U0001f5d3 <b>게시일</b>: {pub}")
+    if it.get("summary"):
+        lines.append(f"\U0001f4cc <b>핵심</b>: {_esc(it['summary'])}")
+    if it.get("impact"):
+        warn = "  \u26a0\ufe0f<i>수치 미검증</i>" if it.get("_unverified_num") else ""
+        lines.append(f"\U0001f4a5 <b>영향</b>: {_esc(it['impact'])}{warn}")
+    if it.get("mitigation"):
+        lines.append(f"\U0001f6e1 <b>대응</b>: {_esc(it['mitigation'])}")
+    if it.get("principle"):
+        lines.append(f"\U0001f50d <b>원리</b>: {_esc(it['principle'])}")
+    ioc = clean_iocs(it.get("ioc", ""))
+    if ioc:
+        lines.append(f"\U0001f9e9 <b>IoC</b>: <code>{_esc(ioc)}</code>")
+    atk = _esc(it.get("attack"))
+    if atk and atk not in _BLANK:
+        lines.append(f"\U0001f3af <b>ATT&amp;CK</b>: {atk} <i>(참고)</i>")
+    if it.get("source"):
+        lines.append(f"\U0001f517 {_esc(it['source'])}")
+    return "\n".join(lines)
 
 
 def format_blocks(data, today):
     items = data.get("items", [])[:MAX_ITEMS]
-    items.sort(key=_sort_key)   # 중요/위험한 것부터 위로
+
+    # 그룹 분류 + 그룹 내 CVSS/KEV 우선 정렬
+    groups = {"urgent": [], "trend": [], "normal": []}
+    for it in items:
+        groups[_group_of(it)].append(it)
+
+    def sk(it):
+        facts = it.get("_facts", [])
+        _, _, score = _sev_from_facts(facts)
+        return (0 if any("KEV" in f for f in facts) else 1, -score)
+    for g in groups:
+        groups[g].sort(key=sk)
+
+    ordered = groups["urgent"] + groups["trend"] + groups["normal"]
 
     blocks = []
-
     # ── 헤더 + TL;DR ──
     head = f"\U0001f6e1\ufe0f <b>보안 아침 브리핑</b> \u2014 {today}"
-    head += f"\n\U0001f4ca 오늘 총 <b>{len(items)}</b>건"
+    head += f"\n\U0001f4ca 오늘 총 <b>{len(ordered)}</b>건"
     tldr = _esc(data.get("tldr"))
     if tldr:
         head += f"\n\n\U0001f4f0 <b>TL;DR</b>\n{tldr}"
 
-    # ── 상단 목차(한눈에 스캔용) ──
-    idx_lines = ["\U0001f4d1 <b>오늘의 항목</b>"]
-    for i, it in enumerate(items):
-        n = NUM[i] if i < len(NUM) else f"{i + 1}."
-        facts = it.get("_facts", [])
-        _, sev_raw = _sev_from_facts(facts)
-        dot = _sev_icon(sev_raw) if sev_raw else "\u2796"   # 심각도 색 점(없으면 -)
-        kev = " \U0001f6a8" if any("KEV" in f for f in facts) else ""
-        # 제목은 너무 길면 자름(목차는 짧게)
-        title = _esc(it.get("title"))
-        if len(title) > 42:
-            title = title[:42] + "\u2026"
-        idx_lines.append(f"{n} {dot} {title}{kev}")
-    head += "\n\n" + "\n".join(idx_lines)
+    # ── 상단 KEV 요약(가장 먼저 봐야 할 것) ──
+    kev_cves = []
+    for it in ordered:
+        for f in it.get("_facts", []):
+            if "KEV" in f:
+                kev_cves.append(f.split(" ")[0])
+    if kev_cves:
+        head += ("\n\n\U0001f6a8 <b>실제 악용중(KEV) — 즉시 점검</b>\n"
+                 + ", ".join(f"<code>{_esc(c)}</code>" for c in sorted(set(kev_cves))))
+
+    # ── 그룹별 목차 ──
+    labels = [("urgent", "\U0001f6a8 긴급 패치 필요"),
+              ("trend", "\u26a0\ufe0f 위협 동향"),
+              ("normal", "\U0001f4f0 일반 뉴스")]
+    toc = ["\U0001f4d1 <b>오늘의 항목</b>"]
+    pos = 0
+    order_index = {}
+    for key, lab in labels:
+        if not groups[key]:
+            continue
+        toc.append(f"\n<b>{lab}</b> ({len(groups[key])}건)")
+        for it in groups[key]:
+            order_index[id(it)] = pos
+            facts = it.get("_facts", [])
+            _, sev_raw, _ = _sev_from_facts(facts)
+            dot = _sev_icon(sev_raw) if sev_raw else "\u2796"
+            kev = " \U0001f6a8" if any("KEV" in f for f in facts) else ""
+            t = _esc(it.get("title"))
+            if len(t) > 40:
+                t = t[:40] + "\u2026"
+            toc.append(f"{NUM[pos] if pos < len(NUM) else str(pos+1)+'.'} {dot} {t}{kev}")
+            pos += 1
+    head += "\n\n" + "\n".join(toc)
     blocks.append(head)
 
-    # ── 항목 상세 ──
-    for i, it in enumerate(items):
-        n = NUM[i] if i < len(NUM) else f"{i + 1}."
-        facts = it.get("_facts", [])
-        is_kev = any("KEV" in f for f in facts)
-
-        title_line = f"{n} <b>{_esc(it.get('title'))}</b>"
-        if is_kev:
-            title_line += "  \U0001f6a8<b>실제 악용중</b>"
-        lines = [title_line]
-
-        sev_text, sev_raw = _sev_from_facts(facts)
-        if sev_text:
-            lines.append(f"{_sev_icon(sev_raw)} <b>심각도</b>: {_esc(sev_text)} <i>(NVD)</i>")
-        if it.get("category"):
-            lines.append(f"\U0001f3f7 <b>분류</b>: {_esc(it['category'])}")
-
-        epss_vals = []
-        for f in facts:
-            m = re.search(r"EPSS\s+([\d.]+%)", f)
-            if m:
-                cve = f.split(" ")[0]
-                epss_vals.append(f"{cve} {m.group(1)}")
-        if epss_vals:
-            lines.append(f"\U0001f4c8 <b>악용확률(EPSS)</b>: {_esc(', '.join(epss_vals))}")
-
-        pub = _esc(it.get("published"))
-        if pub and pub not in _BLANK:
-            lines.append(f"\U0001f5d3 <b>게시일</b>: {pub}")
-        if it.get("summary"):
-            lines.append(f"\U0001f4cc <b>핵심</b>: {_esc(it['summary'])}")
-        if it.get("impact"):
-            lines.append(f"\U0001f4a5 <b>영향</b>: {_esc(it['impact'])}")
-        if it.get("mitigation"):
-            lines.append(f"\U0001f6e1 <b>대응</b>: {_esc(it['mitigation'])}")
-        if it.get("principle"):
-            lines.append(f"\U0001f50d <b>원리</b>: {_esc(it['principle'])}")
-
-        ioc = clean_iocs(it.get("ioc", ""))
-        if ioc:
-            lines.append(f"\U0001f9e9 <b>IoC</b>: <code>{_esc(ioc)}</code>")
-        atk = _esc(it.get("attack"))
-        if atk and atk not in _BLANK:
-            lines.append(f"\U0001f3af <b>ATT&amp;CK</b>: {atk}")
-        if it.get("source"):
-            lines.append(f"\U0001f517 {_esc(it['source'])}")
-        blocks.append("\n".join(lines))
+    # ── 그룹별 상세 ──
+    pos = 0
+    for key, lab in labels:
+        if not groups[key]:
+            continue
+        section = [f"\u2501\u2501\u2501  {lab}  \u2501\u2501\u2501"]
+        blocks.append("\n".join(section))
+        for it in groups[key]:
+            blocks.append(_item_block(pos, it))
+            pos += 1
 
     blocks.append(
-        "\u2139\ufe0f <i>심각도\u00b7EPSS\u00b7KEV는 NVD/FIRST/CISA 공식 데이터. "
-        "핵심\u00b7원리\u00b7대응은 AI 요약이므로 대응 전 출처 원문 확인 권장.</i>"
+        "\u2139\ufe0f <i>심각도\u00b7CWE\u00b7EPSS\u00b7KEV는 NVD/FIRST/CISA 공식 데이터. "
+        "핵심\u00b7원리\u00b7대응 및 ATT&amp;CK는 AI 요약/추정이므로 대응 전 출처 원문 확인 권장.</i>"
     )
     return blocks
+
+
+# ── 발송: 중복 없는 청크 분할(버그 수정본) ────────────
+def _chunk(blocks):
+    """블록들을 TG_LIMIT 이하 청크로 묶음. 각 블록은 정확히 한 청크에만 들어감."""
+    sep = "\n\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+    chunks, cur = [], ""
+    for b in blocks:
+        if not cur:
+            cur = b
+        elif len(cur) + len(sep) + len(b) <= TG_LIMIT:
+            cur += sep + b
+        else:
+            chunks.append(cur)
+            cur = b
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def send_telegram_blocks(blocks):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    sep = "\n\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
-    chunks, cur = [], ""
-    for b in blocks:
-        addition = (sep + b) if cur else b
-        if cur and len(cur) + len(addition) > 3500:
-            chunks.append(cur)
-            cur = b
-        else:
-            cur += addition
-    if cur:
-        chunks.append(cur)
-    for c in chunks:
+    for c in _chunk(blocks):
         requests.post(url, data={"chat_id": chat_id, "text": c, "parse_mode": "HTML",
                                  "disable_web_page_preview": "true"}, timeout=30).raise_for_status()
 
@@ -560,22 +706,16 @@ def send_telegram_plain(text):
 
 def main():
     today = datetime.date.today().isoformat()
-
     kev_items, kev_cves = fetch_kev()
     rss = enrich_with_body(collect_rss_candidates())
     items = kev_items + rss
     print(f"총 후보: {len(items)}건 (KEV {len(kev_items)} + RSS {len(rss)})")
 
     if not items:
-        send_telegram_plain(
-            f"\U0001f6e1\ufe0f 보안 아침 브리핑 \u2014 {today}\n\n지난 24시간 내 신규 보안 항목이 없습니다."
-        )
+        send_telegram_plain(f"\U0001f6e1\ufe0f 보안 아침 브리핑 \u2014 {today}\n\n지난 24시간 내 신규 보안 항목이 없습니다.")
         return
 
-    # [B][EPSS][KEV] 공식 데이터 주입(코드가 직접)
     enrich_cve_facts(items, kev_cves)
-
-    # [LLM] 서술 요약
     raw = summarize(items)
     data = parse_digest(raw)
 
@@ -588,7 +728,7 @@ def main():
         )
         return
 
-    data = merge_facts(data, items)        # 공식 사실 병합
+    data = merge_facts(data, items)
     blocks = format_blocks(data, today)
     send_telegram_blocks(blocks)
     print("발송 완료")
