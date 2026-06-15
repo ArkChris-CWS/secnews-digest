@@ -35,9 +35,9 @@ FEEDS = {
     "보안뉴스":          ("https://www.boannews.com/media/news_rss.xml", True),
     # 공식 1차 소스 ──
     "CISA Advisories":   ("https://www.cisa.gov/cybersecurity-advisories/all.xml", True),
-    # 미검증(URL 동적/차단 가능) → 실패해도 스킵. 동작 확인되면 True 로 승격
-    "KISA 보안공지":     ("https://knvd.krcert.or.kr/rss/securityNotice.do", False),
-    "KISA 보안권고":     ("https://www.boho.or.kr/rss/securityNotice.do", False),
+    # 미검증(URL 동적/차단 가능) → 실패해도 조용히 스킵. 정확한 주소 확인되면 True 로 승격.
+    # KISA 보호나라 보안공지(B0000133)의 RSS 후보들 — 하나라도 살아있으면 수집됨
+    "KISA 보안공지":   ("https://www.boho.or.kr/kr/rss.do?bbsId=B0000133", False),
 }
 
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -433,17 +433,48 @@ NUM = ["1\ufe0f\u20e3", "2\ufe0f\u20e3", "3\ufe0f\u20e3", "4\ufe0f\u20e3", "5\uf
        "6\ufe0f\u20e3", "7\ufe0f\u20e3", "8\ufe0f\u20e3", "9\ufe0f\u20e3", "\U0001f51f"]
 
 
-def format_blocks(data, today):
-    blocks = []
-    items = data.get("items", [])[:MAX_ITEMS]
+def _sort_key(it):
+    """정렬: KEV(실제악용) 먼저 → CVSS 높은 순 → 나머지."""
+    facts = it.get("_facts", [])
+    is_kev = any("KEV" in f for f in facts)
+    score = -1.0
+    for f in facts:
+        m = re.search(r"CVSS\s+([\d.]+)", f)
+        if m:
+            score = max(score, float(m.group(1)))
+    return (0 if is_kev else 1, -score)
 
+
+def format_blocks(data, today):
+    items = data.get("items", [])[:MAX_ITEMS]
+    items.sort(key=_sort_key)   # 중요/위험한 것부터 위로
+
+    blocks = []
+
+    # ── 헤더 + TL;DR ──
     head = f"\U0001f6e1\ufe0f <b>보안 아침 브리핑</b> \u2014 {today}"
     head += f"\n\U0001f4ca 오늘 총 <b>{len(items)}</b>건"
     tldr = _esc(data.get("tldr"))
     if tldr:
         head += f"\n\n\U0001f4f0 <b>TL;DR</b>\n{tldr}"
+
+    # ── 상단 목차(한눈에 스캔용) ──
+    idx_lines = ["\U0001f4d1 <b>오늘의 항목</b>"]
+    for i, it in enumerate(items):
+        n = NUM[i] if i < len(NUM) else f"{i + 1}."
+        facts = it.get("_facts", [])
+        _, sev_raw = _sev_from_facts(facts)
+        dot = _sev_icon(sev_raw) if sev_raw else "\u2796"   # 심각도 색 점(없으면 -)
+        kev = " \U0001f6a8" if any("KEV" in f for f in facts) else ""
+        # 제목은 너무 길면 자름(목차는 짧게)
+        title = _esc(it.get("title"))
+        if len(title) > 42:
+            title = title[:42] + "\u2026"
+        idx_lines.append(f"{n} {dot} {title}{kev}")
+    head += "\n\n" + "\n".join(idx_lines)
     blocks.append(head)
 
+    # ── 항목 상세 ──
     for i, it in enumerate(items):
         n = NUM[i] if i < len(NUM) else f"{i + 1}."
         facts = it.get("_facts", [])
@@ -454,15 +485,12 @@ def format_blocks(data, today):
             title_line += "  \U0001f6a8<b>실제 악용중</b>"
         lines = [title_line]
 
-        # 심각도: 공식(NVD) 우선, 없으면 표시 안 함(LLM은 빈값 강제)
         sev_text, sev_raw = _sev_from_facts(facts)
         if sev_text:
             lines.append(f"{_sev_icon(sev_raw)} <b>심각도</b>: {_esc(sev_text)} <i>(NVD)</i>")
-
         if it.get("category"):
             lines.append(f"\U0001f3f7 <b>분류</b>: {_esc(it['category'])}")
 
-        # EPSS(악용확률)
         epss_vals = []
         for f in facts:
             m = re.search(r"EPSS\s+([\d.]+%)", f)
@@ -484,7 +512,7 @@ def format_blocks(data, today):
         if it.get("principle"):
             lines.append(f"\U0001f50d <b>원리</b>: {_esc(it['principle'])}")
 
-        ioc = clean_iocs(it.get("ioc", ""))   # 더미 필터 적용
+        ioc = clean_iocs(it.get("ioc", ""))
         if ioc:
             lines.append(f"\U0001f9e9 <b>IoC</b>: <code>{_esc(ioc)}</code>")
         atk = _esc(it.get("attack"))
@@ -495,8 +523,8 @@ def format_blocks(data, today):
         blocks.append("\n".join(lines))
 
     blocks.append(
-        "\u2139\ufe0f <i>심각도·EPSS·KEV는 NVD/FIRST/CISA 공식 데이터. "
-        "핵심·원리·대응은 AI 요약이므로 대응 전 출처 원문 확인 권장.</i>"
+        "\u2139\ufe0f <i>심각도\u00b7EPSS\u00b7KEV는 NVD/FIRST/CISA 공식 데이터. "
+        "핵심\u00b7원리\u00b7대응은 AI 요약이므로 대응 전 출처 원문 확인 권장.</i>"
     )
     return blocks
 
