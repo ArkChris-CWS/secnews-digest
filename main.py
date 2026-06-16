@@ -3,7 +3,11 @@
 보안 아침 브리핑 봇 (실무 브리핑 v11)
 대상: 모의해킹/정보보안 실무자의 '오늘 어떤 CVE를 먼저 봐야 하는가' 판단용.
 
-=== v11 신규 ===
+=== v12 신규 ===
+[상태] 개별 아이콘(🔴 실제 악용 · 💀 랜섬웨어 · 🧨 공개 PoC) 한 줄
+[노출] 외부 노출형 자산(VPN/네트워크/원격관리/웹)일 때 '🌐 인터넷 노출 시 우선 확인'
+[추천] 상단 '🧪 오늘 분석/재현 추천' — 위험도 상위 3건 자동 선정(모의해킹 후보)
+=== v11 ===
 [위험도] 가중치 완화 + 임계값 재조정(KEV 단독=높음 보장). 과도한 PoC 가중 제거
 [상태] 🔴 실제 악용 확인 — 근거 나열(CISA KEV·랜섬웨어·공개 PoC)
 [자산유형] 제품명/CWE → 자산 유형 매핑(VPN/네트워크장비/원격관리/AI Gateway/웹/개발도구 등). 코드 기반
@@ -153,6 +157,10 @@ ASSET_KEYWORDS = [
 ]
 
 
+# 외부(인터넷) 노출 가능성이 높은 자산 유형 — 우선 확인 대상
+EXTERNAL_ASSETS = {"VPN", "네트워크 장비", "원격 관리/지원", "웹/CMS", "이메일", "AI/LLM 인프라"}
+
+
 def detect_asset(text):
     """제목/제품명 텍스트에서 영향 자산 유형 추정(코드 매핑, 환각 없음). 최대 2개."""
     t = (text or "").lower()
@@ -163,6 +171,12 @@ def detect_asset(text):
         if len(hits) >= 2:
             break
     return " / ".join(hits)
+
+
+def _is_external(it):
+    """영향 자산이 외부 노출형인지(인터넷 우선 확인 대상)."""
+    a = it.get("_asset", "")
+    return any(x in a for x in EXTERNAL_ASSETS)
 
 
 # ── 유틸 ──────────────────────────────────────────────
@@ -872,12 +886,21 @@ def _item_block(idx, it):
             line += " " + _esc(it['_versions'][0]) + " <i>(영향 버전)</i>"
         lines.append(line)
     if it.get("_asset"):   # 영향 자산 유형(코드 매핑) — "우리 환경에 해당?" 빠른 판단
-        lines.append(f"\U0001f5a5\ufe0f <b>영향 자산</b>: {_esc(it['_asset'])}")
-    exp, grounds = _exploit_status(it)
-    if exp:
-        added = f", 등록 {it['_kev_added']}" if it.get("_kev_added") else ""
-        g = (" \u2014 근거: " + " · ".join(grounds)) if grounds else ""
-        lines.append(f"\U0001f6a8 <b>상태</b>: {exp}{g}{added}")
+        asset_line = f"\U0001f5a5\ufe0f <b>영향 자산</b>: {_esc(it['_asset'])}"
+        if _is_external(it):
+            asset_line += "  \U0001f310<i>인터넷 노출 시 우선 확인</i>"
+        lines.append(asset_line)
+    # 상태: 개별 아이콘으로 한눈에(🔴 실제 악용 / 💀 랜섬웨어 / 🧨 공개 PoC)
+    badges = []
+    if _is_kev(it):
+        badges.append("\U0001f534 실제 악용(KEV)")
+    if it.get("_ransomware"):
+        badges.append("\U0001f480 랜섬웨어 사용")
+    if _has_poc(it):
+        badges.append("\U0001f9e8 공개 PoC")
+    if badges:
+        added = f"  (등록 {it['_kev_added']})" if it.get("_kev_added") else ""
+        lines.append("\U0001f6a8 <b>상태</b>: " + "  ·  ".join(badges) + added)
     cve_line = _cve_line(it)
     if cve_line:
         lines.append("\U0001f522 <b>CVE</b>:\n" + cve_line)
@@ -954,6 +977,28 @@ def format_blocks(data, today):
     tldr = _esc(data.get("tldr"))
     if tldr:
         head += f"\n\n\U0001f4f0 <b>오늘의 요약</b>\n{tldr}"
+
+    # 🧪 오늘 분석/재현 추천 — 위험도 상위 CVE 자동 선정(모의해킹/취약점분석 후보)
+    def _rec_reason(it):
+        rs = []
+        if _is_kev(it): rs.append("KEV")
+        if _has_poc(it): rs.append("공개 PoC")
+        if it.get("_ransomware"): rs.append("랜섬웨어")
+        if _max_score(it) >= 9.0: rs.append("CVSS≥9")
+        if it.get("_cwe_top25"): rs.append("CWE Top25")
+        if _is_supply(it): rs.append("공급망")
+        return ", ".join(rs[:3])
+
+    cve_items = [it for it in ordered if it.get("_cve_recs") and risk_level(it)]
+    cve_items.sort(key=lambda it: -(risk_level(it)[2]))
+    recs = [it for it in cve_items if (risk_level(it)[2] >= 5 or _is_kev(it) or _has_poc(it))][:3]
+    if recs:
+        rec_lines = ["\n\U0001f9ea <b>오늘 분석/재현 추천</b>"]
+        for i, it in enumerate(recs, 1):
+            cve = next((r["cve"] for r in it["_cve_recs"]), "")
+            reason = _rec_reason(it)
+            rec_lines.append(f"{i}. <code>{_esc(cve)}</code>" + (f" \u2014 {reason}" if reason else ""))
+        head += "\n" + "\n".join(rec_lines)
 
     # 목차(짧은 라벨)
     toc = ["\n\U0001f4d1 <b>목차</b>"]
