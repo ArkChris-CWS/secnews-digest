@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-보안 아침 브리핑 봇 (실무 브리핑 v10)
+보안 아침 브리핑 봇 (실무 브리핑 v11)
 대상: 모의해킹/정보보안 실무자의 '오늘 어떤 CVE를 먼저 봐야 하는가' 판단용.
 
-=== v10 신규 ===
+=== v11 신규 ===
+[위험도] 가중치 완화 + 임계값 재조정(KEV 단독=높음 보장). 과도한 PoC 가중 제거
+[상태] 🔴 실제 악용 확인 — 근거 나열(CISA KEV·랜섬웨어·공개 PoC)
+[자산유형] 제품명/CWE → 자산 유형 매핑(VPN/네트워크장비/원격관리/AI Gateway/웹/개발도구 등). 코드 기반
+[CWE Top25] 2024 CWE Top 25 포함 여부 표시(정적 리스트, 무료)
+=== v10 ===
 [위험도] KEV/랜섬웨어/CVSS/EPSS백분위 가중치로 '🔥 우선순위: 매우높음/높음/보통/낮음' 한 줄
 [PoC] 원문 본문에서 정규식으로 'PoC/exploit available' 표현 탐지 → 🧨 공개 PoC 언급(원문)
 [영향버전] NVD versionEndExcluding/StartIncluding 추출 → '5.5.15 이하' 형태
@@ -112,6 +117,52 @@ CWE_LABEL = {  # 분석 섹션에 코드+영문명
     "CWE-420": "Unprotected Alternate Channel", "CWE-74": "Injection",
     "CWE-200": "Information Exposure", "CWE-798": "Hard-coded Credentials",
 }
+
+# 2024 CWE Top 25 Most Dangerous Software Weaknesses (MITRE/CISA, 무료 공개)
+CWE_TOP25_2024 = {
+    "CWE-79", "CWE-787", "CWE-89", "CWE-352", "CWE-22", "CWE-125", "CWE-78",
+    "CWE-416", "CWE-862", "CWE-434", "CWE-94", "CWE-20", "CWE-77", "CWE-287",
+    "CWE-269", "CWE-502", "CWE-200", "CWE-863", "CWE-918", "CWE-119", "CWE-476",
+    "CWE-798", "CWE-190", "CWE-400", "CWE-306",
+}
+
+# 제품명 키워드 → 영향 자산 유형(소문자 부분일치). "우리 환경에 해당?" 빠른 판단용.
+ASSET_KEYWORDS = [
+    (("globalprotect", "anyconnect", "ivanti connect", "pulse secure", "openvpn",
+      "wireguard", "vpn", "fortigate ssl"), "VPN"),
+    (("sd-wan", "router", "switch", "firewall", "fortigate", "fortios", "pan-os",
+      "asa", "ios xe", "junos", "netscaler", "edgerouter", "mikrotik"), "네트워크 장비"),
+    (("simplehelp", "screenconnect", "anydesk", "teamviewer", "remote access",
+      "rmm", "connectwise", "vnc", "rdp gateway"), "원격 관리/지원"),
+    (("litellm", "ai gateway", "llm", "ollama", "langchain", "vllm",
+      "model server", "copilot", "openai", "anthropic"), "AI/LLM 인프라"),
+    (("wordpress", "drupal", "joomla", "magento", "plugin", "cms",
+      "apache", "nginx", "tomcat", "iis", "php", "웹"), "웹/CMS"),
+    (("vmware", "esxi", "vcenter", "hyper-v", "proxmox", "citrix hypervisor",
+      "xenserver"), "가상화/하이퍼바이저"),
+    (("kubernetes", "docker", "containerd", "openshift", "aws ", "azure ",
+      "gcp ", "s3 ", "cloud"), "클라우드/컨테이너"),
+    (("vscode", "cursor", "github", "gitlab", "jenkins", "npm", "pypi",
+      "maven", "sentry", "ci/cd", "developer", "개발"), "개발 도구/공급망"),
+    (("exchange", "outlook", "smtp", "imap", "postfix", "zimbra", "메일", "email"), "이메일"),
+    (("active directory", "kerberos", "ldap", "okta", "keycloak", "oidc",
+      "saml", "auth0", "identity"), "인증/계정 인프라"),
+    (("sql server", "mysql", "postgres", "oracle database", "mongodb",
+      "redis", "elasticsearch", "database", "db"), "데이터베이스"),
+    (("android", "ios ", "iphone", "windows", "macos", "linux kernel"), "엔드포인트/OS"),
+]
+
+
+def detect_asset(text):
+    """제목/제품명 텍스트에서 영향 자산 유형 추정(코드 매핑, 환각 없음). 최대 2개."""
+    t = (text or "").lower()
+    hits = []
+    for kws, label in ASSET_KEYWORDS:
+        if any(k in t for k in kws) and label not in hits:
+            hits.append(label)
+        if len(hits) >= 2:
+            break
+    return " / ".join(hits)
 
 
 # ── 유틸 ──────────────────────────────────────────────
@@ -383,7 +434,7 @@ def enrich_cve_facts(items, kev_meta):
         cves = cves[:MAX_CVE_PER_ITEM + 5]  # 너무 많으면 뒤에서 자름
         recs = []
         cls_set, cwe_disp, prod_set, ver_set = [], [], [], []
-        kev_added, ransomware = "", False
+        kev_added, ransomware, cwe_top25 = "", False, False
         for cve in cves:
             nv = cache.get(cve) or {}
             rec = {"cve": cve, "in_nvd": nv.get("in_nvd", None),
@@ -400,6 +451,8 @@ def enrich_cve_facts(items, kev_meta):
                     cls_set.append(c)
                 lab = CWE_LABEL.get(nv["cwe"], "")
                 cwe_disp.append(nv["cwe"] + (f" {lab}" if lab else ""))
+                if nv["cwe"] in CWE_TOP25_2024:
+                    cwe_top25 = True
             if nv.get("product"):
                 prod_set.append(nv["product"])
             if nv.get("version"):
@@ -418,6 +471,11 @@ def enrich_cve_facts(items, kev_meta):
         if kev_added:
             it["_kev_added"] = kev_added
         it["_ransomware"] = ransomware
+        it["_cwe_top25"] = cwe_top25
+        # 영향 자산 유형: 제품명 우선, 없으면 제목으로 추정
+        asset = detect_asset(" ".join(prod_set)) or detect_asset(it.get("title", ""))
+        if asset:
+            it["_asset"] = asset
         # PoC: 원문 본문에 '공개 PoC/익스플로잇' 표현이 명시됐는지(코드 탐지)
         it["_poc_mentioned"] = bool(POC_RE.search(it.get("content", "")))
     print(f"CVE 사실 주입 완료 / 대상 {len(all_cves)}개 (NVD 신규 {len(miss)})")
@@ -599,13 +657,19 @@ def merge_facts(data, src_items):
         src = next((by_cve[c] for c in cves if c in by_cve), None)
         if src:
             for key in ("_cve_recs", "_cwe_class", "_cwes", "_products", "_versions",
-                        "_kev_added", "_ransomware", "_total_cves", "_poc_mentioned"):
+                        "_kev_added", "_ransomware", "_total_cves", "_poc_mentioned",
+                        "_asset", "_cwe_top25"):
                 if key in src:
                     out[key] = src[key]
             body = src.get("content", "")
             out["_unverified_num"] = verify_numbers(out.get("impact_extra", ""), body) if body else False
             # PoC: 매칭된 원문 본문 기준으로 직접 탐지(코드, 환각 없음)
             out["_poc_mentioned"] = bool(POC_RE.search(body)) if body else out.get("_poc_mentioned", False)
+        # 자산 유형이 아직 없으면(주로 CVE 없는 기사) 제목 기준으로 추정
+        if not out.get("_asset"):
+            a = detect_asset(out.get("title", "") + " " + out.get("summary", ""))
+            if a:
+                out["_asset"] = a
     return data
 
 
@@ -661,16 +725,18 @@ def risk_level(it):
     """
     score = 0
     if _is_kev(it):
-        score += 5
+        score += 5          # 실제 악용이 가장 중요
     if it.get("_ransomware"):
-        score += 3
-    if _has_poc(it):
         score += 2
+    if _has_poc(it):
+        score += 1          # PoC 존재만으로 폭증하지 않게(완화)
     cvss = _max_score(it)
     if cvss >= 9.0:
-        score += 3
+        score += 3          # Critical 단독도 '보통' 이상
     elif cvss >= 7.0:
-        score += 1
+        score += 2          # High
+    elif cvss >= 4.0:
+        score += 1          # Medium
     perc = _max_percentile(it)
     if perc >= 95:
         score += 2
@@ -679,25 +745,30 @@ def risk_level(it):
     # 평가할 근거(공식 데이터)가 전혀 없으면 표시 안 함
     if cvss < 0 and not _is_kev(it) and perc < 0 and not _has_poc(it):
         return None
+    # 임계값: KEV 단독(5)이 '높음' 보장. 매우높음 7+/높음 5-6/보통 3-4/낮음 1-2
     if score >= 7:
         return ("매우 높음", "\U0001f534", score)
-    if score >= 4:
+    if score >= 5:
         return ("높음", "\U0001f7e0", score)
-    if score >= 2:
+    if score >= 3:
         return ("보통", "\U0001f7e1", score)
     return ("낮음", "\U0001f7e2", score)
 
 
 def _exploit_status(it):
-    """실제 악용/PoC 근거 기반 상태. 공식·원문 근거만 사용(과표기 방지)."""
+    """실제 악용/PoC 상태 + 근거 나열. 공식·원문 근거만 사용(과표기 방지)."""
+    grounds = []
     if _is_kev(it):
-        s = "\U0001f534 실제 악용 확인(KEV)"
-        if _has_poc(it):
-            s += " + 공개 PoC"
-        return s
+        grounds.append("CISA KEV")
+    if it.get("_ransomware"):
+        grounds.append("\U0001f480랜섬웨어 사용 확인")
     if _has_poc(it):
-        return "\U0001f7e0 공개 PoC 언급(원문)"
-    return ""
+        grounds.append("공개 PoC(원문)")
+    if _is_kev(it):
+        return "\U0001f534 실제 악용 확인", grounds
+    if _has_poc(it):
+        return "\U0001f7e0 공개 PoC 언급", grounds
+    return "", grounds
 
 
 def _is_supply(it):
@@ -800,17 +871,18 @@ def _item_block(idx, it):
         if it.get("_versions"):
             line += " " + _esc(it['_versions'][0]) + " <i>(영향 버전)</i>"
         lines.append(line)
-    exp = _exploit_status(it)
+    if it.get("_asset"):   # 영향 자산 유형(코드 매핑) — "우리 환경에 해당?" 빠른 판단
+        lines.append(f"\U0001f5a5\ufe0f <b>영향 자산</b>: {_esc(it['_asset'])}")
+    exp, grounds = _exploit_status(it)
     if exp:
-        extra = []
-        if it.get("_kev_added"):
-            extra.append(f"등록 {it['_kev_added']}")
-        if it.get("_ransomware"):
-            extra.append("\U0001f480랜섬웨어 악용")
-        lines.append(f"\U0001f6a8 <b>상태</b>: {exp}" + (f" ({', '.join(extra)})" if extra else ""))
+        added = f", 등록 {it['_kev_added']}" if it.get("_kev_added") else ""
+        g = (" \u2014 근거: " + " · ".join(grounds)) if grounds else ""
+        lines.append(f"\U0001f6a8 <b>상태</b>: {exp}{g}{added}")
     cve_line = _cve_line(it)
     if cve_line:
         lines.append("\U0001f522 <b>CVE</b>:\n" + cve_line)
+    if it.get("_cwe_top25"):
+        lines.append("\u26a0\ufe0f <b>CWE Top 25</b> 포함")
     if it.get("summary"):
         lines.append(f"\U0001f4cc <b>핵심</b>: {_esc(it['summary'])}")
     if it.get("impact_extra") and _esc(it["impact_extra"]) not in _BLANK:
