@@ -138,8 +138,10 @@ ASSET_KEYWORDS = [
       "asa", "ios xe", "junos", "netscaler", "edgerouter", "mikrotik"), "네트워크 장비"),
     (("simplehelp", "screenconnect", "anydesk", "teamviewer", "remote access",
       "rmm", "connectwise", "vnc", "rdp gateway"), "원격 관리/지원"),
-    (("litellm", "ai gateway", "llm", "ollama", "langchain", "vllm",
-      "model server", "copilot", "openai", "anthropic"), "AI/LLM 인프라"),
+    (("litellm", "ai gateway", "llm gateway", "model gateway",
+      "inference gateway", "copilot"), "AI Gateway"),
+    (("ollama", "vllm", "lm studio", "langchain", "local model",
+      "self-hosted model", "inference server"), "AI/LLM 인프라"),
     (("wordpress", "drupal", "joomla", "magento", "plugin", "cms",
       "apache", "nginx", "tomcat", "iis", "php", "웹"), "웹/CMS"),
     (("vmware", "esxi", "vcenter", "hyper-v", "proxmox", "citrix hypervisor",
@@ -158,7 +160,7 @@ ASSET_KEYWORDS = [
 
 
 # 외부(인터넷) 노출 가능성이 높은 자산 유형 — 우선 확인 대상
-EXTERNAL_ASSETS = {"VPN", "네트워크 장비", "원격 관리/지원", "웹/CMS", "이메일", "AI/LLM 인프라"}
+EXTERNAL_ASSETS = {"VPN", "네트워크 장비", "원격 관리/지원", "웹/CMS", "이메일", "AI Gateway"}
 
 
 def detect_asset(text):
@@ -242,14 +244,16 @@ def collect_rss_candidates():
 
 def dedup_candidates(cands):
     """같은 CVE 포함 OR 제목 유사도≥0.82면 병합."""
+    def _cves_of(x):
+        return {m.upper() for m in CVE_RE.findall(
+            x.get("title", "") + " " + x.get("summary", "") + " " + x.get("content", ""))}
     kept = []
     for c in cands:
         nt = _norm_title(c["title"])
-        c_cves = {m.upper() for m in CVE_RE.findall(c["title"] + " " + c.get("summary", ""))}
+        c_cves = _cves_of(c)
         dup = False
         for k in kept:
-            k_cves = k.setdefault("_cves", {m.upper() for m in
-                     CVE_RE.findall(k["title"] + " " + k.get("summary", ""))})
+            k_cves = k.setdefault("_cves", _cves_of(k))
             same_cve = bool(c_cves & k_cves)
             sim = difflib.SequenceMatcher(None, nt, _norm_title(k["title"])).ratio()
             if same_cve or sim >= DEDUP_RATIO:
@@ -769,20 +773,6 @@ def risk_level(it):
     return ("낮음", "\U0001f7e2", score)
 
 
-def _exploit_status(it):
-    """실제 악용/PoC 상태 + 근거 나열. 공식·원문 근거만 사용(과표기 방지)."""
-    grounds = []
-    if _is_kev(it):
-        grounds.append("CISA KEV")
-    if it.get("_ransomware"):
-        grounds.append("\U0001f480랜섬웨어 사용 확인")
-    if _has_poc(it):
-        grounds.append("공개 PoC(원문)")
-    if _is_kev(it):
-        return "\U0001f534 실제 악용 확인", grounds
-    if _has_poc(it):
-        return "\U0001f7e0 공개 PoC 언급", grounds
-    return "", grounds
 
 
 def _is_supply(it):
@@ -990,7 +980,8 @@ def format_blocks(data, today):
         return ", ".join(rs[:3])
 
     cve_items = [it for it in ordered if it.get("_cve_recs") and risk_level(it)]
-    cve_items.sort(key=lambda it: -(risk_level(it)[2]))
+    cve_items.sort(key=lambda it: (-(risk_level(it)[2]), -int(_is_kev(it)),
+                                   -int(_has_poc(it)), -_max_score(it)))
     recs = [it for it in cve_items if (risk_level(it)[2] >= 5 or _is_kev(it) or _has_poc(it))][:3]
     if recs:
         rec_lines = ["\n\U0001f9ea <b>오늘 분석/재현 추천</b>"]
@@ -1093,8 +1084,11 @@ def main():
     today = datetime.datetime.now(KST).strftime("%Y-%m-%d")
     kev_items, kev_meta = fetch_kev()
     rss = enrich_with_body(collect_rss_candidates())
-    items = kev_items + rss
-    print(f"총 후보 {len(items)} (KEV {len(kev_items)} + RSS {len(rss)})")
+    # 같은 CVE를 KEV 항목과 기사가 둘 다 다루면 중복 → 병합.
+    # RSS(기사 본문이 풍부)를 앞에 둬 본문을 보존. KEV 사실(CVSS/KEV/랜섬 등)은
+    # enrich_cve_facts가 CVE 기준으로 주입하므로 KEV 항목이 흡수돼도 KEV 표시는 유지됨.
+    items = dedup_candidates(rss + kev_items)
+    print(f"총 후보 {len(items)} (RSS {len(rss)} + KEV {len(kev_items)} → 병합 {len(items)})")
 
     if not items:
         send_telegram_blocks([f"\U0001f6e1\ufe0f <b>보안 아침 브리핑</b> \u2014 {today}\n\n지난 24시간 내 신규 보안 항목이 없습니다."])
