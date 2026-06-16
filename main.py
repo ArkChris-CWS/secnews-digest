@@ -642,10 +642,9 @@ def format_blocks(data, today):
             _, sev_raw, _ = _sev_from_facts(facts)
             dot = _sev_icon(sev_raw) if sev_raw else "\u2796"
             kev = " \U0001f6a8" if any("KEV" in f for f in facts) else ""
-            t = _esc(it.get("title"))
-            if len(t) > 40:
-                t = t[:40] + "\u2026"
-            toc.append(f"{NUM[pos] if pos < len(NUM) else str(pos+1)+'.'} {dot} {t}{kev}")
+            t = _esc(it.get("title"))   # 전체 제목 표시(자르지 않음)
+            num = NUM[pos] if pos < len(NUM) else f"{pos+1}."
+            toc.append(f"{num} {dot} {t}{kev}")
             pos += 1
     head += "\n\n" + "\n".join(toc)
     blocks.append(head)
@@ -655,8 +654,7 @@ def format_blocks(data, today):
     for key, lab in labels:
         if not groups[key]:
             continue
-        section = [f"\u2501\u2501\u2501  {lab}  \u2501\u2501\u2501"]
-        blocks.append("\n".join(section))
+        blocks.append(f"<b>{lab}</b>")   # 청크 구분선과 겹치지 않게 라벨만
         for it in groups[key]:
             blocks.append(_item_block(pos, it))
             pos += 1
@@ -705,7 +703,9 @@ def send_telegram_plain(text):
 
 
 def main():
-    today = datetime.date.today().isoformat()
+    # 표시 날짜는 한국시간(KST=UTC+9) 기준. GitHub Actions는 UTC라 그냥 today()면 하루 밀림.
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    today = datetime.datetime.now(KST).strftime("%Y-%m-%d")
     kev_items, kev_cves = fetch_kev()
     rss = enrich_with_body(collect_rss_candidates())
     items = kev_items + rss
