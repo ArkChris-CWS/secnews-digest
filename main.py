@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-보안 아침 브리핑 봇 (실무 브리핑 v9)
+보안 아침 브리핑 봇 (실무 브리핑 v10)
 대상: 모의해킹/정보보안 실무자의 '오늘 어떤 CVE를 먼저 봐야 하는가' 판단용.
 
-=== v9 신규 ===
+=== v10 신규 ===
+[위험도] KEV/랜섬웨어/CVSS/EPSS백분위 가중치로 '🔥 우선순위: 매우높음/높음/보통/낮음' 한 줄
+[PoC] 원문 본문에서 정규식으로 'PoC/exploit available' 표현 탐지 → 🧨 공개 PoC 언급(원문)
+[영향버전] NVD versionEndExcluding/StartIncluding 추출 → '5.5.15 이하' 형태
+[ATT&CK] 🔬분석 내에서도 맨 끝으로 이동
+=== v9 ===
 [그룹] 🚨KEV(실제악용) / 🔗공급망 / ⚠️위협동향 / 📰일반  (4단)
 [상단] 'TL;DR' 라벨 → '오늘의 요약' + '오늘 우선 확인' 통계(KEV/Critical/CVSS9+/공급망/랜섬웨어)
 [2단 본문] 운영(심각도/CWE/분류/EPSS/KEV/핵심/즉시조치) + 🔬분석(원리/IoC/ATT&CK/출처)
@@ -63,6 +68,13 @@ RETRYABLE_STATUS = (500, 502, 503, 504)   # 429 제외!
 UA = {"User-Agent": "Mozilla/5.0 (compatible; secnews-digest/4.0)"}
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
 TG_LIMIT = 3500
+
+# 원문에 '공개 PoC/익스플로잇 존재'가 명시됐는지 탐지(코드 기반, 환각 없음)
+POC_RE = re.compile(
+    r"(proof[\s-]?of[\s-]?concept|\bPoC\b|exploit\s+(?:code\s+)?(?:is\s+)?(?:publicly\s+)?available"
+    r"|publicly\s+available\s+exploit|exploit\s+released|released\s+an?\s+exploit"
+    r"|metasploit\s+module|exploit\s+code\s+(?:was\s+)?published|PoC\s+exploit)",
+    re.I)
 
 
 # ── CWE → 침투/실무 분류 매핑 ─────────────────────────
@@ -283,26 +295,42 @@ def nvd_lookup(cve, cache):
                             break
                     if cwe:
                         break
-                # CPE에서 벤더/제품(대표 1개)
-                product = ""
+                # CPE에서 벤더/제품(대표 1개) + 영향 버전 범위
+                product, version = "", ""
                 try:
                     for cfg in obj.get("configurations", []):
                         for node in cfg.get("nodes", []):
                             for m in node.get("cpeMatch", []):
                                 parts = m.get("criteria", "").split(":")
                                 if len(parts) > 5 and parts[3] != "*":
-                                    vend = parts[3].replace("_", " ").title()
-                                    prod = parts[4].replace("_", " ").title()
-                                    product = f"{vend} {prod}".strip()
+                                    if not product:
+                                        vend = parts[3].replace("_", " ").title()
+                                        prod = parts[4].replace("_", " ").title()
+                                        product = f"{vend} {prod}".strip()
+                                    # 버전 범위(가장 정보량 많은 첫 매치)
+                                    if not version:
+                                        ee = m.get("versionEndExcluding")
+                                        ei = m.get("versionEndIncluding")
+                                        si = m.get("versionStartIncluding")
+                                        se = m.get("versionStartExcluding")
+                                        cpe_ver = parts[5] if len(parts) > 5 else "*"
+                                        if ee:
+                                            version = f"< {ee}" + (f" (≥{si})" if si else "")
+                                        elif ei:
+                                            version = f"≤ {ei}" + (f" (≥{si})" if si else "")
+                                        elif si or se:
+                                            version = (f"≥ {si}" if si else f"> {se}")
+                                        elif cpe_ver not in ("*", "-"):
+                                            version = cpe_ver
                                     break
-                            if product:
+                            if product and version:
                                 break
-                        if product:
+                        if product and version:
                             break
                 except Exception:
                     pass
                 result = {"score": score, "severity": sev, "cwe": cwe, "product": product,
-                          "in_nvd": True}
+                          "version": version, "in_nvd": True}
         elif r.status_code == 404:
             result = {"in_nvd": False}
     except Exception:
@@ -354,7 +382,7 @@ def enrich_cve_facts(items, kev_meta):
     for it, cves in zip(items, per_item):
         cves = cves[:MAX_CVE_PER_ITEM + 5]  # 너무 많으면 뒤에서 자름
         recs = []
-        cls_set, cwe_disp, prod_set = [], [], []
+        cls_set, cwe_disp, prod_set, ver_set = [], [], [], []
         kev_added, ransomware = "", False
         for cve in cves:
             nv = cache.get(cve) or {}
@@ -374,6 +402,8 @@ def enrich_cve_facts(items, kev_meta):
                 cwe_disp.append(nv["cwe"] + (f" {lab}" if lab else ""))
             if nv.get("product"):
                 prod_set.append(nv["product"])
+            if nv.get("version"):
+                ver_set.append(nv["version"])
             recs.append(rec)
         it["_cve_recs"] = recs
         it["_total_cves"] = len(set(cves))
@@ -383,9 +413,13 @@ def enrich_cve_facts(items, kev_meta):
             it["_cwes"] = list(dict.fromkeys(cwe_disp))
         if prod_set:
             it["_products"] = list(dict.fromkeys(prod_set))
+        if ver_set:
+            it["_versions"] = list(dict.fromkeys(ver_set))
         if kev_added:
             it["_kev_added"] = kev_added
         it["_ransomware"] = ransomware
+        # PoC: 원문 본문에 '공개 PoC/익스플로잇' 표현이 명시됐는지(코드 탐지)
+        it["_poc_mentioned"] = bool(POC_RE.search(it.get("content", "")))
     print(f"CVE 사실 주입 완료 / 대상 {len(all_cves)}개 (NVD 신규 {len(miss)})")
 
 
@@ -564,12 +598,14 @@ def merge_facts(data, src_items):
         cves = sorted({m.upper() for m in CVE_RE.findall(text)})
         src = next((by_cve[c] for c in cves if c in by_cve), None)
         if src:
-            for key in ("_cve_recs", "_cwe_class", "_cwes", "_products",
-                        "_kev_added", "_ransomware", "_total_cves"):
+            for key in ("_cve_recs", "_cwe_class", "_cwes", "_products", "_versions",
+                        "_kev_added", "_ransomware", "_total_cves", "_poc_mentioned"):
                 if key in src:
                     out[key] = src[key]
             body = src.get("content", "")
             out["_unverified_num"] = verify_numbers(out.get("impact_extra", ""), body) if body else False
+            # PoC: 매칭된 원문 본문 기준으로 직접 탐지(코드, 환각 없음)
+            out["_poc_mentioned"] = bool(POC_RE.search(body)) if body else out.get("_poc_mentioned", False)
     return data
 
 
@@ -601,11 +637,67 @@ def _is_kev(it):
     return any(r.get("kev") for r in it.get("_cve_recs", []))
 
 
-def _exploit_status(it):
-    """🔴 실제악용(KEV) / 🟡 ... / 🟢 ... — 무료 공식근거 기반."""
+def _max_percentile(it):
+    best = -1.0
+    for r in it.get("_cve_recs", []):
+        p = r.get("percentile", "")
+        m = re.match(r"([\d.]+)", p or "")
+        if m:
+            best = max(best, float(m.group(1)))
+    return best
+
+
+def _has_poc(it):
+    return bool(it.get("_poc_mentioned"))
+
+
+def risk_level(it):
+    """
+    공식 데이터 기반 위험도(균형 가중치). KEV(실제 악용)를 가장 무겁게.
+      KEV +5 / 랜섬웨어 +3 / 공개 PoC(원문) +2 / CVSS≥9 +3, ≥7 +1
+      / EPSS 백분위 ≥95 +2, ≥90 +1
+    합계 → 매우 높음(7+) / 높음(4-6) / 보통(2-3) / 낮음(0-1)
+    반환: (라벨, 이모지, 점수) | None(평가 근거 없음)
+    """
+    score = 0
     if _is_kev(it):
-        return "\U0001f534 실제 악용 확인(KEV)"
-    return ""   # PoC 미수집이라 그 외 단계는 표시 안 함(과표기 방지)
+        score += 5
+    if it.get("_ransomware"):
+        score += 3
+    if _has_poc(it):
+        score += 2
+    cvss = _max_score(it)
+    if cvss >= 9.0:
+        score += 3
+    elif cvss >= 7.0:
+        score += 1
+    perc = _max_percentile(it)
+    if perc >= 95:
+        score += 2
+    elif perc >= 90:
+        score += 1
+    # 평가할 근거(공식 데이터)가 전혀 없으면 표시 안 함
+    if cvss < 0 and not _is_kev(it) and perc < 0 and not _has_poc(it):
+        return None
+    if score >= 7:
+        return ("매우 높음", "\U0001f534", score)
+    if score >= 4:
+        return ("높음", "\U0001f7e0", score)
+    if score >= 2:
+        return ("보통", "\U0001f7e1", score)
+    return ("낮음", "\U0001f7e2", score)
+
+
+def _exploit_status(it):
+    """실제 악용/PoC 근거 기반 상태. 공식·원문 근거만 사용(과표기 방지)."""
+    if _is_kev(it):
+        s = "\U0001f534 실제 악용 확인(KEV)"
+        if _has_poc(it):
+            s += " + 공개 PoC"
+        return s
+    if _has_poc(it):
+        return "\U0001f7e0 공개 PoC 언급(원문)"
+    return ""
 
 
 def _is_supply(it):
@@ -651,6 +743,8 @@ def _short_label(it):
     sc = _max_score(it)
     if not tag and sc >= 9.0:
         tag = " Critical"
+    if _has_poc(it):
+        tag += " \U0001f9e8PoC"
     return f"{base}{tag}"
 
 
@@ -681,6 +775,12 @@ def _item_block(idx, it):
         title += "  \U0001f6a8"
     lines = [title]
 
+    # 🔥 위험도 한 줄(공식 데이터 종합) — 제목 바로 아래(1초 판단)
+    rl = risk_level(it)
+    if rl:
+        label, emoji, _sc = rl
+        lines.append(f"\U0001f525 <b>우선순위</b>: {emoji} {label}")
+
     # 운영 영역
     sc = _max_score(it)
     if sc >= 0:
@@ -695,7 +795,11 @@ def _item_block(idx, it):
     if cls and _esc(cls) not in _BLANK:
         lines.append(f"\U0001f3f7 <b>분류</b>: {_esc(cls)}")
     if it.get("_products"):
-        lines.append(f"\U0001f3af <b>영향 제품</b>: {_esc(', '.join(it['_products'][:4]))}")
+        prod = ', '.join(it['_products'][:4])
+        line = f"\U0001f3af <b>영향 제품</b>: {_esc(prod)}"
+        if it.get("_versions"):
+            line += " " + _esc(it['_versions'][0]) + " <i>(영향 버전)</i>"
+        lines.append(line)
     exp = _exploit_status(it)
     if exp:
         extra = []
@@ -715,7 +819,7 @@ def _item_block(idx, it):
     if it.get("action") and _esc(it["action"]) not in _BLANK:
         lines.append(f"\U0001f6a8 <b>즉시 조치</b>: {_esc(it['action'])}")
 
-    # 🔬 분석 영역
+    # 🔬 분석 영역 (원리 → CWE → IoC → 게시일 → 출처 → ATT&CK 맨 끝)
     ana = []
     if it.get("principle") and _esc(it["principle"]) not in _BLANK:
         ana.append(f"\U0001f50d <b>원리</b>: {_esc(it['principle'])}")
@@ -724,14 +828,14 @@ def _item_block(idx, it):
     ioc = clean_iocs(it.get("ioc", ""))
     if ioc:
         ana.append(f"\U0001f9e9 <b>IoC</b>: <code>{_esc(ioc)}</code>")
-    atk = _esc(it.get("attack"))
-    if atk and atk not in _BLANK:
-        ana.append(f"\U0001f3af <b>ATT&amp;CK</b>: {atk} <i>(AI 추정·미검증)</i>")
     pub = _esc(it.get("published"))
     if pub and pub not in _BLANK:
         ana.append(f"\U0001f5d3 <b>게시일</b>: {pub}")
     if it.get("source"):
         ana.append(f"\U0001f517 {_esc(it['source'])}")
+    atk = _esc(it.get("attack"))
+    if atk and atk not in _BLANK:   # ATT&CK는 참고 정보 → 분석 맨 끝
+        ana.append(f"\U0001f3af <b>ATT&amp;CK</b>: {atk} <i>(AI 추정·미검증)</i>")
     if ana:
         lines.append("\n\U0001f52c <b>분석</b>")
         lines.extend(ana)
@@ -745,7 +849,9 @@ def format_blocks(data, today):
         groups[_group_of(it)].append(it)
 
     def sk(it):
-        return (0 if _is_kev(it) else 1, -_max_score(it))
+        rl = risk_level(it)
+        rscore = rl[2] if rl else -1
+        return (0 if _is_kev(it) else 1, -rscore, -_max_score(it))
     for g in groups:
         groups[g].sort(key=sk)
     ordered = sum((groups[k] for k, _ in GROUPS), [])
@@ -753,15 +859,16 @@ def format_blocks(data, today):
     # 통계
     n_kev = sum(1 for it in ordered if _is_kev(it))
     n_crit = sum(1 for it in ordered if _max_score(it) >= 9.0)
-    n_c9 = sum(1 for it in ordered if _max_score(it) >= 9.0)
     n_supply = len(groups["supply"])
     n_ransom = sum(1 for it in ordered if it.get("_ransomware"))
+    n_poc = sum(1 for it in ordered if _has_poc(it))
 
     head = f"\U0001f6e1\ufe0f <b>보안 아침 브리핑</b> \u2014 {today}  (총 {len(ordered)}건)"
     # 오늘 우선 확인(1초 판단)
     stat = []
     if n_kev: stat.append(f"실제 악용(KEV) {n_kev}")
     if n_crit: stat.append(f"Critical {n_crit}")
+    if n_poc: stat.append(f"\U0001f9e8공개 PoC {n_poc}")
     if n_supply: stat.append(f"공급망 {n_supply}")
     if n_ransom: stat.append(f"\U0001f480랜섬웨어 {n_ransom}")
     if stat:
@@ -800,7 +907,8 @@ def format_blocks(data, today):
             pos += 1
 
     blocks.append(
-        "\u2139\ufe0f <i>심각도·CWE·분류·EPSS·KEV·제품·랜섬웨어는 NVD/FIRST/CISA 공식 데이터. "
+        "\u2139\ufe0f <i>심각도·CWE·분류·EPSS·KEV·제품·버전·랜섬웨어는 NVD/FIRST/CISA 공식 데이터, "
+        "공개 PoC는 원문 명시 기반, 우선순위는 이들 종합 산출. "
         "핵심·원리·조치·ATT&amp;CK는 AI 요약/추정이므로 대응 전 출처 원문 확인.</i>"
     )
     return blocks
