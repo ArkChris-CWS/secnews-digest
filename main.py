@@ -80,6 +80,9 @@ DEDUP_RATIO = 0.82
 # Google API에서 그때그때 최신 Flash 모델을 자동으로 찾아 이 리스트 앞에 붙여준다.
 FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-flash-latest"]
 
+# 이번 실행에서 실제 요약에 성공한 모델명을 기록(로그 + 브리핑 하단 표기용)
+LAST_SUCCESS_MODEL = {"name": None}
+
 MODEL_LIST_API = "https://generativelanguage.googleapis.com/v1beta/models"
 MODEL_CACHE_FILE = "gemini_model_cache.json"
 MODEL_CACHE_TTL = 24 * 3600
@@ -690,6 +693,8 @@ def summarize(items):
             try:
                 raw = _call_gemini(model, payload, use_json_mime=use_json)
                 if parse_digest(raw):
+                    print(f"[{model}] ✅ 성공 — 이번 브리핑은 이 모델로 생성됨")
+                    LAST_SUCCESS_MODEL["name"] = model
                     return raw
                 print(f"[{model}] JSON 파싱 실패 → 재요청")
                 attempt += 1
@@ -1077,10 +1082,11 @@ def format_blocks(data, today):
             blocks.append(_item_block(pos, it))
             pos += 1
 
+    model_note = f" (요약: {LAST_SUCCESS_MODEL['name']})" if LAST_SUCCESS_MODEL["name"] else ""
     blocks.append(
         "\u2139\ufe0f <i>심각도·CWE·분류·EPSS·KEV·제품·버전·랜섬웨어는 NVD/FIRST/CISA 공식 데이터, "
         "공개 PoC는 원문 명시 기반, 우선순위는 이들 종합 산출. "
-        "핵심·원리·조치·ATT&amp;CK는 AI 요약/추정이므로 대응 전 출처 원문 확인.</i>"
+        f"핵심·원리·조치·ATT&amp;CK는 AI 요약/추정이므로 대응 전 출처 원문 확인.{model_note}</i>"
     )
     return blocks
 
