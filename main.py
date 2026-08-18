@@ -75,7 +75,18 @@ MAX_ITEMS = 8
 MAX_CVE_PER_ITEM = 3       # 한 항목에 표시할 대표 CVE 수
 DEDUP_RATIO = 0.82
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+# 2026-08-18: gemini-2.0-flash 종료(404) 확인 후 제거, 3.6 Flash(GA) 계열로 갱신.
+# 이 리스트는 '자동감지 실패 시 안전망'. 정상 경로는 아래 discover_latest_flash_models()가
+# Google API에서 그때그때 최신 Flash 모델을 자동으로 찾아 이 리스트 앞에 붙여준다.
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-flash-latest"]
+
+MODEL_LIST_API = "https://generativelanguage.googleapis.com/v1beta/models"
+MODEL_CACHE_FILE = "gemini_model_cache.json"
+MODEL_CACHE_TTL = 24 * 3600
+# 자동감지에서 제외할 비-텍스트/실험용 계열(잘못 고르면 그날 요약이 통째로 실패할 수 있음)
+MODEL_EXCLUDE = ("embed", "aqa", "tts", "image", "vision", "live", "audio",
+                  "video", "robotics", "computer-use", "nano-banana", "imagen",
+                  "veo", "preview", "exp", "thinking")
 MAX_RETRIES_503 = 2        # 503/타임아웃만 짧게 재시도(429는 재시도 안 함)
 RETRYABLE_STATUS = (500, 502, 503, 504)   # 429 제외!
 
@@ -320,23 +331,70 @@ def fetch_kev():
 
 
 # ── NVD 캐시 ──────────────────────────────────────────
-def _load_cache():
+def _load_cache(path=NVD_CACHE_FILE, ttl=NVD_CACHE_TTL):
     try:
-        with open(NVD_CACHE_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             c = json.load(f)
-        if time.time() - c.get("_ts", 0) < NVD_CACHE_TTL:
+        if time.time() - c.get("_ts", 0) < ttl:
             return c.get("data", {})
     except Exception:
         pass
     return {}
 
 
-def _save_cache(d):
+def _save_cache(d, path=NVD_CACHE_FILE):
     try:
-        with open(NVD_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"_ts": time.time(), "data": d}, f)
     except Exception:
         pass
+
+
+def _model_version_key(model_id):
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", model_id)
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (0, 0)
+
+
+def discover_latest_flash_models():
+    """
+    Gemini ListModels API로 현재 계정에서 실제 쓸 수 있는 Flash 계열 중
+    최신 버전을 자동 선정(일반형 1개 + Lite형 1개). 매일 1회만 조회(24h 캐시).
+    실패하면 빈 리스트 → FALLBACK_MODELS만 사용되므로 항상 안전.
+    """
+    cached = _load_cache(MODEL_CACHE_FILE, MODEL_CACHE_TTL).get("models")
+    if cached is not None:
+        return cached
+    found = []
+    try:
+        r = requests.get(MODEL_LIST_API, params={"key": os.environ["GEMINI_API_KEY"]}, timeout=15)
+        if r.status_code == 200:
+            best = {}   # "flash"/"lite" -> (버전튜플, 모델id)
+            for m in r.json().get("models", []):
+                mid = m.get("name", "").replace("models/", "")
+                if "flash" not in mid or any(x in mid for x in MODEL_EXCLUDE):
+                    continue
+                if "generateContent" not in m.get("supportedGenerationMethods", []):
+                    continue
+                kind = "lite" if "lite" in mid else "flash"
+                v = _model_version_key(mid)
+                if kind not in best or v > best[kind][0]:
+                    best[kind] = (v, mid)
+            found = [best[k][1] for k in ("flash", "lite") if k in best]
+            print(f"모델 자동감지: {found or '해당 없음(폴백 사용)'}")
+    except Exception as ex:
+        print(f"모델 자동감지 실패({ex}) → 폴백 리스트 사용")
+    _save_cache({"models": found}, MODEL_CACHE_FILE)
+    return found
+
+
+def get_gemini_model_list():
+    """자동감지 결과를 앞에 붙이고 FALLBACK_MODELS로 안전망(중복 제거)."""
+    seen, models = set(), []
+    for m in discover_latest_flash_models() + FALLBACK_MODELS:
+        if m not in seen:
+            seen.add(m)
+            models.append(m)
+    return models
 
 
 def nvd_lookup(cve, cache):
@@ -625,7 +683,7 @@ def summarize(items):
     slim = [{k: it[k] for k in ("source", "title", "content", "content_type", "published", "link") if k in it}
             for it in items]
     payload = json.dumps(slim, ensure_ascii=False, indent=2)
-    for model in GEMINI_MODELS:
+    for model in get_gemini_model_list():
         use_json = True
         attempt = 0
         while attempt <= MAX_RETRIES_503:
