@@ -65,7 +65,6 @@ secnews-digest/
 - 모의해킹용 보강 소스(주석으로 포함됨): **PortSwigger Research**(웹 취약점 원리), **Exploit-DB**(PoC 출현).
   켤 때는 주석을 풀고 최신 RSS URL이 맞는지 확인할 것.
 - 국내 공식 소스(KISA 보호나라/KrCERT, KNVD)도 RSS를 제공한다:
-  - https://knvd.krcert.or.kr/rssList.do
   - https://krcert.or.kr/kr/subPage.do?menuNo=205121
 
 ---

@@ -1,0 +1,27 @@
+name: keepalive
+
+# 60일 무활동 시 GitHub Actions가 스케줄을 자동 비활성화하는 것을 막기 위해,
+# 매달 1일 자동으로 커밋 하나를 만들어 저장소 활동을 유지한다.
+# (daily.yml의 실행 자체는 활동으로 안 잡히므로 이 워크플로가 따로 필요)
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"   # 매달 1일 00:00 UTC
+  workflow_dispatch: {}    # 수동 실행 버튼(테스트용)
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Touch keepalive file and commit
+        run: |
+          date -u +"%Y-%m-%d %H:%M UTC" > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --staged --quiet || git commit -m "chore: keepalive (prevent 60-day schedule disable)"
+          git push
